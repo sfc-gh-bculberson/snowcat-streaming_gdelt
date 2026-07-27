@@ -1,0 +1,32 @@
+spec:
+  containers:
+    - name: gdelt-incremental-job
+      image: /{{ database }}/GDELT/{{ image_repo }}/gdelt-incremental:latest
+      command:
+        - python
+        - main.py
+      env:
+        SNOWFLAKE_DATABASE: "{{ database }}"
+        SNOWFLAKE_SCHEMA: GDELT
+        SNOWFLAKE_TABLE_EVENTS: EVENTS
+        SNOWFLAKE_TABLE_MENTIONS: EVENTMENTIONS
+        SNOWFLAKE_TABLE_GKG: GKG
+        SNOWFLAKE_WATERMARK_TABLE: GDELT_WATERMARK
+        SNOWFLAKE_WATERMARK_CHANNEL: gdelt_watermark
+        SNOWFLAKE_ROLE: "{{ role }}"
+        AUTHORIZATION_TYPE: SPCS
+        SPCS_TOKEN_PATH: /snowflake/session/token
+        SNOWFLAKE_CLIENT_NAME: gdelt-incremental
+        BATCH_SIZE: "1000"
+        MAX_CATCHUP_WINDOWS: "8"
+        DATA_DIR: /tmp/gdelt
+      resources:
+        requests:
+          cpu: "0.5"
+          memory: 1Gi
+        limits:
+          cpu: "1"
+          memory: 2Gi
+capabilities:
+  securityContext:
+    enableCustomCredentials: true
