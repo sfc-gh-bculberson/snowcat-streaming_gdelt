@@ -156,8 +156,8 @@ DEFAULT_TABLE_NAMES: Dict[TableKind, str] = {
     "gkg": "GKG",
 }
 
-# GDELT filename suffixes, used both to detect table kind from a masterfilelist
-# URL and to construct predictable URLs for a given 15-minute timestamp.
+# GDELT filename suffixes used to construct per-window download URLs
+# ({ts}.export.CSV.zip / {ts}.mentions.CSV.zip / {ts}.gkg.csv.zip).
 FILENAME_SUFFIXES: Dict[TableKind, str] = {
     "events": "export.CSV.zip",
     "mentions": "mentions.CSV.zip",

@@ -19,8 +19,8 @@
 --
 -- Role needs EXECUTE MANAGED TASK (granted in sql/setup_snowflake.sql).
 
-USE ROLE <role>;
-USE DATABASE <database>;
+USE ROLE ACCOUNTADMIN;
+USE DATABASE SC_DB;
 USE SCHEMA GDELT;
 
 CREATE OR REPLACE TASK GDELT_INCREMENTAL_TASK
@@ -29,13 +29,13 @@ CREATE OR REPLACE TASK GDELT_INCREMENTAL_TASK
   COMMENT = 'Serverless task: pull newest GDELT 15-min trio via SPCS job + Snowpipe Streaming'
   AS
   BEGIN
-    DROP SERVICE IF EXISTS <database>.GDELT.<job_name>;
+    DROP SERVICE IF EXISTS SC_DB.GDELT.GDELT_INCREMENTAL_JOB;
     EXECUTE JOB SERVICE
-      IN COMPUTE POOL <compute_pool>
-      FROM @<database>.GDELT.<stage>
+      IN COMPUTE POOL GDELT_INCREMENTAL_POOL
+      FROM @SC_DB.GDELT.GDELT_STAGE
       SPECIFICATION_FILE = 'job_spec.rendered.yaml'
       EXTERNAL_ACCESS_INTEGRATIONS = (gdelt_public_access)
-      NAME = '<database>.GDELT.<job_name>'
+      NAME = 'SC_DB.GDELT.GDELT_INCREMENTAL_JOB'
       ASYNC = TRUE;
   END;
 
@@ -45,5 +45,5 @@ ALTER TASK GDELT_INCREMENTAL_TASK RESUME;
 --   EXECUTE TASK GDELT_INCREMENTAL_TASK;                          -- run immediately, out of schedule
 --   SELECT * FROM TABLE(INFORMATION_SCHEMA.TASK_HISTORY(
 --     TASK_NAME => 'GDELT_INCREMENTAL_TASK')) ORDER BY SCHEDULED_TIME DESC;
---   CALL SYSTEM$GET_SERVICE_LOGS('<database>.GDELT.<job_name>', 0, 'gdelt-incremental-job');
+--   CALL SYSTEM$GET_SERVICE_LOGS('SC_DB.GDELT.GDELT_INCREMENTAL_JOB', 0, 'gdelt-incremental-job');
 --   ALTER TASK GDELT_INCREMENTAL_TASK SUSPEND;                    -- pause the schedule

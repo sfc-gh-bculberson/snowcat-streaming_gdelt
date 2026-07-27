@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""Create GDELT tables, Snowpipe Streaming pipes, and the watermark streaming
-sink (table + pipe). Watermark *progress* is a standard-channel offset token;
-the sink table only exists as the pipe COPY target.
+"""Create (or fully reset) GDELT tables, Snowpipe Streaming pipes, and the
+watermark streaming sink (table + pipe). Watermark *progress* is a standard-
+channel offset token; the sink table only exists as the pipe COPY target.
 
-Run once from a laptop (key-pair / password auth) after sql/setup_snowflake.sql.
-If an older SQL-state GDELT_WATERMARK row exists, this script seeds the channel
-offset token from it so the next job run continues without re-ingest.
+Run from a laptop (key-pair / password auth) after sql/setup_snowflake.sql.
+
+By default this DROPs and recreates all objects so fact tables are empty and
+streaming channels (including the watermark offset token) are cleared — the
+next job run cold-starts with only the latest ~15-minute window.
+
+Set SEED_WATERMARK_TIMESTAMP to force an offset token after recreate (optional).
 """
 
 from __future__ import annotations
@@ -89,26 +93,6 @@ def _connect() -> snowflake.connector.SnowflakeConnection:
     return snowflake.connector.connect(**kwargs)
 
 
-def _legacy_sql_watermark(cur, database: str, schema: str) -> str | None:
-    """Read LAST_TIMESTAMP from a pre-offset-token watermark table, if present."""
-    fqn = f"{database}.{schema}.{WATERMARK_TABLE}"
-    try:
-        cur.execute(f"DESCRIBE TABLE {fqn}")
-        cols = {str(row[0]).upper() for row in cur.fetchall()}
-    except snowflake.connector.errors.ProgrammingError:
-        return None
-    if "LAST_TIMESTAMP" not in cols:
-        return None
-    if "ID" in cols:
-        cur.execute(f"SELECT LAST_TIMESTAMP FROM {fqn} WHERE ID = 1")
-    else:
-        cur.execute(f"SELECT MAX(LAST_TIMESTAMP) FROM {fqn}")
-    row = cur.fetchone()
-    if row is None or row[0] is None:
-        return None
-    return str(row[0])
-
-
 def _seed_offset_token(seed_ts: str) -> None:
     config.validate()
     client = wm.open_client()
@@ -129,12 +113,11 @@ def main() -> None:
     schema = os.getenv("SNOWFLAKE_SCHEMA", SNOWFLAKE_SCHEMA).strip() or SNOWFLAKE_SCHEMA
     wm_table = WATERMARK_TABLE
     wm_pipe = watermark_pipe_name()
-    legacy_ts: str | None = None
 
     conn = _connect()
     try:
         with conn.cursor() as cur:
-            print(f"Creating schema {database}.{schema} ...")
+            print(f"Ensuring schema {database}.{schema} ...")
             cur.execute(f"CREATE SCHEMA IF NOT EXISTS {database}.{schema}")
 
             for table in TABLE_ORDER:
@@ -143,34 +126,31 @@ def main() -> None:
                 table_fqn = f"{database}.{schema}.{tbl_name}"
                 pipe_fqn = f"{database}.{schema}.{pipe}"
 
-                print(f"Creating table {table_fqn} ...")
+                # Drop pipe first so streaming channels (and any offset tokens)
+                # are cleared along with the empty recreate.
+                print(f"Resetting {pipe_fqn} + {table_fqn} ...")
+                cur.execute(f"DROP PIPE IF EXISTS {pipe_fqn}")
+                cur.execute(f"DROP TABLE IF EXISTS {table_fqn}")
                 cur.execute(render_table_ddl(table, database, schema, tbl_name))
-
-                print(f"Creating pipe {pipe_fqn} ...")
                 cur.execute(render_pipe_ddl(table, database, schema, tbl_name, pipe))
 
             watermark_fqn = f"{database}.{schema}.{wm_table}"
-            legacy_ts = _legacy_sql_watermark(cur, database, schema)
-
-            # Recreate as streaming sink (drop old ID/MERGE shape if present).
-            print(f"Creating watermark streaming sink {watermark_fqn} ...")
+            pipe_fqn = f"{database}.{schema}.{wm_pipe}"
+            print(f"Resetting watermark {pipe_fqn} + {watermark_fqn} ...")
+            cur.execute(f"DROP PIPE IF EXISTS {pipe_fqn}")
             cur.execute(f"DROP TABLE IF EXISTS {watermark_fqn}")
             cur.execute(render_watermark_table_ddl(database, schema, wm_table))
-
-            pipe_fqn = f"{database}.{schema}.{wm_pipe}"
-            print(f"Creating watermark pipe {pipe_fqn} ...")
-            cur.execute(f"DROP PIPE IF EXISTS {pipe_fqn}")
             cur.execute(render_watermark_pipe_ddl(database, schema, wm_table, wm_pipe))
     finally:
         conn.close()
 
-    seed = os.getenv("SEED_WATERMARK_TIMESTAMP", "").strip() or legacy_ts
+    seed = os.getenv("SEED_WATERMARK_TIMESTAMP", "").strip()
     if seed:
         _seed_offset_token(seed)
     else:
         print(
-            "No legacy/SEED_WATERMARK_TIMESTAMP; channel starts empty "
-            "(first job run cold-starts from latest window only)."
+            "No SEED_WATERMARK_TIMESTAMP; watermark channel starts empty "
+            "(first job run cold-starts from the latest ~15-minute window only)."
         )
 
     print("\nGDELT tables, pipes, and watermark streaming sink are ready.")

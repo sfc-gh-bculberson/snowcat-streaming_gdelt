@@ -83,9 +83,11 @@ cat <<EOF
 Then run sql/create_task.sql (with placeholders substituted, e.g. via
 scripts/render_sql.py) to schedule ${SPCS_JOB_NAME} every 15 minutes.
 
+  The job advances watermark+15m (cold start = latest ~15-minute window only).
+
   To trigger one run immediately without waiting for the schedule:
     EXECUTE TASK ${SNOWFLAKE_DATABASE}.${SNOWFLAKE_SCHEMA}.GDELT_INCREMENTAL_TASK;
 
 EOF
 
-log "Deployment artifacts staged. See output above for next steps."
+log "Deployment artifacts ready. See output above for stage PUT + task steps."

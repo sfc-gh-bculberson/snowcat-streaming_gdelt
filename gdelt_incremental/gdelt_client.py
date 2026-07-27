@@ -1,16 +1,19 @@
 """GDELT incremental file discovery and download.
 
 GDELT publishes a new events/mentions/gkg trio every 15 minutes at a fixed
-naming convention (``YYYYMMDDHHMMSS.<suffix>``) and always points
-``lastupdate.txt`` at the most recent trio:
+naming convention (``YYYYMMDDHHMMSS.<suffix>``):
 
-    http://data.gdeltproject.org/gdeltv2/lastupdate.txt
+    http://data.gdeltproject.org/gdeltv2/YYYYMMDDHHMMSS.export.CSV.zip
 
-Unlike ../streaming_gdelt (which strides across the full masterfilelist for a
-one-time bulk/load-test import), this loader only ever needs to know "what's
-the latest timestamp" and "what's our watermark", then walks the predictable
-15-minute grid between the two -- no need to fetch or parse the full
-masterfilelist on every run.
+Progress is watermark-driven: each window is ``last_watermark + 15 minutes``.
+After that window is ingested the watermark is set to that window's timestamp.
+We do **not** consult ``lastupdate.txt`` or ``masterfilelist.txt`` — URLs are
+constructed from the timestamp, and upstream 404s mean that table/window is
+absent.
+
+A wall-clock ceiling (floored UTC grid minus a small publish lag) only prevents
+racing ahead of windows that cannot exist yet. Catch-up after an outage is
+successive ``+15 minutes`` steps, capped by ``MAX_CATCHUP_WINDOWS``.
 """
 
 from __future__ import annotations
@@ -76,76 +79,65 @@ def urls_for_timestamp(ts: str) -> Dict[TableKind, GdeltFile]:
     return files
 
 
-def fetch_lastupdate(url: str = config.LASTUPDATE_URL) -> Dict[TableKind, GdeltFile]:
-    """Fetch and parse lastupdate.txt -> the latest GdeltFile per table."""
-    response = requests.get(url, timeout=60)
-    response.raise_for_status()
-    files: Dict[TableKind, GdeltFile] = {}
-    for line in response.text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        parts = line.split()
-        if len(parts) < 3:
-            continue
-        file_url = parts[2]
-        filename = _filename_from_url(file_url)
-        table = _detect_table(filename)
-        if table is None:
-            continue
-        timestamp = filename.split(".", 1)[0]
-        files[table] = GdeltFile(table=table, timestamp=timestamp, url=file_url, filename=filename)
-    return files
+def floor_to_window(dt: datetime) -> datetime:
+    """Floor a timezone-aware datetime to the preceding 15-minute UTC grid point."""
+    if dt.tzinfo is None:
+        raise ValueError("datetime must be timezone-aware")
+    utc = dt.astimezone(timezone.utc)
+    minute = (utc.minute // 15) * 15
+    return utc.replace(minute=minute, second=0, microsecond=0)
 
 
-def _detect_table(filename: str) -> Optional[TableKind]:
-    lowered = filename.lower()
-    for table, suffix in FILENAME_SUFFIXES.items():
-        if lowered.endswith(suffix.lower()):
-            return table
-    return None
+def ingest_ceiling(
+    now: Optional[datetime] = None,
+    lag_windows: int = config.GDELT_LATEST_LAG_WINDOWS,
+) -> str:
+    """Newest window timestamp we will attempt (wall-clock floor minus lag).
+
+    Only used to avoid requesting windows that cannot have been published yet.
+    """
+    if lag_windows < 0:
+        raise ValueError("lag_windows must be >= 0")
+    current = floor_to_window(now or datetime.now(timezone.utc))
+    return format_timestamp(current - WINDOW * lag_windows)
 
 
-def latest_timestamp(lastupdate_files: Dict[TableKind, GdeltFile]) -> Optional[str]:
-    """The trio's shared timestamp (all three files share one window)."""
-    timestamps = {f.timestamp for f in lastupdate_files.values()}
-    if not timestamps:
-        return None
-    return max(timestamps)
+def next_window_after(last_watermark: str) -> str:
+    """The next ingest window: last watermark + 15 minutes."""
+    return format_timestamp(parse_timestamp(last_watermark) + WINDOW)
 
 
 def pending_timestamps(
     last_watermark: Optional[str],
-    latest: str,
+    ceiling: str,
     max_windows: int = config.MAX_CATCHUP_WINDOWS,
 ) -> List[str]:
-    """Ordered list of 15-minute-grid timestamps strictly after the watermark
-    up to and including ``latest``, capped at ``max_windows`` (oldest first).
+    """Windows to ingest this run, oldest first.
 
-    If there is no watermark yet (first-ever run), only ``latest`` is
-    returned -- we intentionally don't backfill history on cold start.
+    With a watermark: ``watermark+15m``, ``watermark+30m``, … while each is
+    ``<= ceiling``, capped at ``max_windows``. After each window is ingested the
+    watermark is set to that window's timestamp.
+
+    With no watermark (cold start): only the single most recent eligible
+    window (``ceiling``) — i.e. within the last ~15 minutes, never a backfill.
     """
-    latest_dt = parse_timestamp(latest)
+    ceiling_dt = parse_timestamp(ceiling)
     if last_watermark is None:
-        return [latest]
-
-    last_dt = parse_timestamp(last_watermark)
-    if last_dt >= latest_dt:
-        return []
+        return [ceiling]
 
     windows: List[str] = []
-    cursor = last_dt + WINDOW
-    while cursor <= latest_dt and len(windows) < max_windows:
+    cursor = parse_timestamp(last_watermark) + WINDOW
+    while cursor <= ceiling_dt and len(windows) < max_windows:
         windows.append(format_timestamp(cursor))
         cursor += WINDOW
 
-    if cursor <= latest_dt:
+    if cursor <= ceiling_dt:
         logger.warning(
-            "Capped catch-up at %d windows; watermark is %s, latest is %s. "
+            "Capped catch-up at %d windows; watermark is %s, ceiling is %s. "
             "Remaining gap will be closed over subsequent runs.",
             max_windows,
             last_watermark,
-            latest,
+            ceiling,
         )
     return windows
 

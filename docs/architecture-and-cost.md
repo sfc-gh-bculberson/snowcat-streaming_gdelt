@@ -35,7 +35,7 @@ flowchart TB
     NP["Network policy ingress<br/>COMPUTE_POOL rule"]
   end
 
-  GDELT["data.gdeltproject.org<br/>lastupdate.txt + 15-min zips"]
+  GDELT["data.gdeltproject.org<br/>constructed 15-min zips"]
   IngestAPI["Snowpipe Streaming ingest API"]
 
   Task -->|"DROP prior job · ASYNC EXECUTE"| Job
@@ -50,6 +50,39 @@ flowchart TB
   Pipes --> Sink
   NP -.-> IngestAPI
 ```
+
+### Window discovery & watermark
+
+Progress is entirely watermark-driven. File URLs are constructed from the
+15-minute timestamp — **no** `lastupdate.txt` and **no** `masterfilelist.txt`
+(those indexes can lag or omit windows; the bulk loader in `../streaming_gdelt`
+uses the masterfilelist for historical backfill instead).
+
+```mermaid
+flowchart TD
+  WM["Read offset token<br/>gdelt_watermark"] --> Empty{Empty?}
+  Empty -->|Yes · cold start| One["Single window = ceiling<br/>≈ last 15 minutes only"]
+  Empty -->|No| Step["window = watermark + 15 minutes"]
+  Step --> Cap{"window ≤ ceiling?<br/>ceiling = floor UTC − lag"}
+  Cap -->|No| Stop([Nothing to do])
+  Cap -->|Yes| Load["Download export / mentions / gkg"]
+  One --> Load
+  Load --> Stream["Elastic append_rows · await"]
+  Stream --> Set["Set watermark = window ts"]
+  Set --> Catchup{"Another +15m<br/>≤ ceiling and under<br/>MAX_CATCHUP_WINDOWS?"}
+  Catchup -->|Yes| Step
+  Catchup -->|No| Exit([Exit 0])
+```
+
+| Mode | Next window(s) | Watermark after success |
+|------|----------------|-------------------------|
+| Cold start (no offset token) | Exactly one: wall-clock ceiling | That window's `YYYYMMDDHHMMSS` |
+| Steady state | `watermark + 15m` (repeat while ≤ ceiling) | Each completed window's timestamp |
+| Catch-up after outage | Successive `+15m` up to `MAX_CATCHUP_WINDOWS` | Advanced per completed window |
+
+`GDELT_LATEST_LAG_WINDOWS` (default `1`) steps the ceiling back from
+`floor(UTC now)` so the job does not race a window GDELT has not published yet.
+Upstream `404` for a table/window is treated as empty and skipped.
 
 ### Per-run sequence
 
@@ -67,13 +100,16 @@ sequenceDiagram
   Note over Task: Task SUCCEEDED (~3–4s)
 
   Job->>WM: open_channel + get_latest_committed_offset_token
-  Job->>GDELT: GET lastupdate.txt
-  Job->>Job: pending windows = (watermark, latest]
+  alt cold start
+    Note over Job: pending = [ceiling]<br/>≈ last 15 minutes
+  else incremental
+    Note over Job: pending = watermark+15m, …<br/>while ≤ ceiling
+  end
 
-  loop each 15-min window (max MAX_CATCHUP_WINDOWS)
-    Job->>GDELT: download export / mentions / gkg zips
+  loop each pending window (max MAX_CATCHUP_WINDOWS)
+    Job->>GDELT: GET {ts}.export / mentions / gkg zips
     Job->>EC: append_rows (await Futures)
-    Job->>WM: append_row + offset_token=ts + wait_for_commit
+    Job->>WM: set watermark = ts (offset_token + wait_for_commit)
   end
 
   Job->>Job: close clients, exit 0
@@ -102,11 +138,13 @@ loader never runs warehouse SQL to read or write watermark state.
 3. Container authenticates with the mounted SPCS session token — no private
    key and **no warehouse**.
 4. Opens standard channel `gdelt_watermark`, reads
-   `get_latest_committed_offset_token()`, fetches `lastupdate.txt`, walks the
-   15-minute grid (capped by `MAX_CATCHUP_WINDOWS`).
+   `get_latest_committed_offset_token()`:
+   - empty → cold start: **one** ceiling window (~last 15 minutes)
+   - else → **watermark + 15 minutes** (catch-up capped by ceiling +
+     `MAX_CATCHUP_WINDOWS`)
 5. For each pending window: download export/mentions/gkg → decode →
-   `append_rows` on three elastic channels (await Futures) → append watermark
-   row with `offset_token=<ts>` and `wait_for_commit`.
+   `append_rows` on three elastic channels (await Futures) → **set watermark
+   to that window's timestamp** (`offset_token=<ts>` + `wait_for_commit`).
 6. Container exits 0; pool idles until `AUTO_SUSPEND_SECS` (300s today), then
    suspends.
 
@@ -120,7 +158,17 @@ former **`QUERY_WAREHOUSE` 60-second resume tax** (~$144/month at list).
 
 ## Volume baseline (measured)
 
-Sampled from the live GDELT `lastupdate.txt` window on 2026-07-27:
+Cold-start verification run on **2026-07-27** for window `20260727204500`
+(single window only; empty watermark after table reset):
+
+| File | Rows loaded |
+|------|-------------|
+| export (events) | 1,179 |
+| mentions | 3,609 |
+| gkg | 1,628 |
+| **Per window** | **~6.4k** |
+
+Earlier size sample for a typical window the same day:
 
 | File | Compressed zip | Uncompressed CSV | Est. NDJSON to SDK | Rows |
 |------|----------------|------------------|--------------------|------|
@@ -250,3 +298,10 @@ WHERE STATE = 'SUCCEEDED';
 | Task | `GDELT_INCREMENTAL_TASK` (serverless, `15 MINUTE`, `ASYNC`, no `QUERY_WAREHOUSE`) |
 | EAI | `gdelt_public_access` |
 | Ingress rule | `SC_DB.SC_SCHEMA.GDELT_LOADER_POOL_INGRESS` |
+
+### Reset inventory
+
+`scripts/create_gdelt_tables.py` **DROPs and recreates** all fact tables,
+pipes, and the watermark sink/pipe so streaming channel offset tokens are
+cleared. With no `SEED_WATERMARK_TIMESTAMP`, the next job cold-starts from the
+latest ~15-minute window only.

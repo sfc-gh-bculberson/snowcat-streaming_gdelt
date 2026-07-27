@@ -3,32 +3,50 @@
 Incremental loader for [GDELT 2.0](http://data.gdeltproject.org/gdeltv2/) that
 runs **entirely inside Snowflake** as a **Snowpark Container Services (SPCS)
 job**, triggered by a Snowflake **Task every 15 minutes** — matching GDELT's
-own 15-minute publish cadence. Each run pulls only the new `events` /
-`mentions` / `gkg` files since the last run and streams them into Snowflake
-using the **Snowpipe Streaming SDK for Python** (`snowpipe-streaming`).
+own 15-minute publish cadence. Each run pulls the next `events` / `mentions` /
+`gkg` window after the last watermark and streams rows into Snowflake with the
+**Snowpipe Streaming SDK for Python** (`snowpipe-streaming`).
 
-This is a lean, always-on companion to [`../streaming_gdelt`](../streaming_gdelt)
-(a Locust-based *bulk historical* loader/load-tester) and reuses its
-Snowflake object conventions (row schema, `ROW_TIMESTAMP` latency tracking,
-`MATCH_BY_COLUMN_NAME` pipes) and its SPCS deployment conventions from
-[`../snowcat-elastic_channels`](../snowcat-elastic_channels) (elastic-channel
-Snowpipe Streaming usage, key-pair/SPCS-token auth switch). There is no
-Locust, no Rust native encoder, and no long-running service here — just a
-small container that runs one ingest cycle and exits.
+This is a lean companion to [`../streaming_gdelt`](../streaming_gdelt) (a
+Locust-based *bulk historical* loader) and reuses its Snowflake object
+conventions (row schema, `ROW_TIMESTAMP` latency tracking,
+`MATCH_BY_COLUMN_NAME` pipes) and SPCS patterns from
+[`../snowcat-elastic_channels`](../snowcat-elastic_channels). There is no
+Locust, no Rust encoder, and no long-running service — just a small container
+that runs one ingest cycle and exits.
 
 ## Architecture & cost
 
-See **[docs/architecture-and-cost.md](./docs/architecture-and-cost.md)** for the full
-architecture diagrams, measured GDELT volumes, and a monthly cost estimate
-(~**$67/month** at Enterprise on-demand $3/credit: mostly SPCS, then serverless
-task compute, with Snowpipe Streaming under $1 — no warehouse for watermark).
+See **[docs/architecture-and-cost.md](./docs/architecture-and-cost.md)** for full
+diagrams, measured volumes, and a monthly cost estimate (~**$67/month** at
+Enterprise on-demand $3/credit).
+
+### How windows are chosen
+
+```mermaid
+flowchart TD
+  Start([Job starts]) --> ReadWM["Read watermark<br/>gdelt_watermark offset token"]
+  ReadWM --> HasWM{Watermark<br/>present?}
+  HasWM -->|No · cold start| Cold["Ingest only ceiling window<br/>≈ last 15 minutes · no backfill"]
+  HasWM -->|Yes| Next["next = watermark + 15 minutes"]
+  Next --> Ready{next ≤ wall-clock<br/>ceiling?}
+  Ready -->|No| Idle([Exit 0 · up to date])
+  Ready -->|Yes| Ingest["Download trio · stream · set watermark = window ts"]
+  Cold --> Ingest
+  Ingest --> More{More +15m windows<br/>≤ ceiling and under<br/>MAX_CATCHUP_WINDOWS?}
+  More -->|Yes| Next
+  More -->|No| Done([Exit 0])
+```
+
+URLs are built as `{GDELT_BASE_URL}/{YYYYMMDDHHMMSS}.{export|mentions|gkg}…`.
+The loader does **not** use `lastupdate.txt` or `masterfilelist.txt`.
 
 ```mermaid
 flowchart LR
   Task["Serverless Task<br/>15 MIN · ASYNC"] -->|"DROP + EXECUTE JOB"| Job["SPCS Job"]
-  Job -->|lastupdate + zips| GDELT["data.gdeltproject.org"]
+  Job -->|"watermark+15m zips"| GDELT["data.gdeltproject.org"]
   Job -->|elastic append_rows| Facts["EVENTS / MENTIONS / GKG"]
-  Job -->|offset_token| WM["gdelt_watermark<br/>standard channel"]
+  Job -->|"offset_token = window ts"| WM["gdelt_watermark"]
 ```
 
 ```mermaid
@@ -41,11 +59,15 @@ sequenceDiagram
 
   Task->>Job: ASYNC EXECUTE JOB SERVICE
   Job->>WM: read latest_committed_offset_token
-  Job->>GDELT: lastupdate.txt + pending windows
-  loop each window
-    Job->>GDELT: download trio
+  alt no watermark (cold start)
+    Note over Job: single window = ceiling<br/>(≈ last 15 minutes)
+  else watermark set
+    Note over Job: next = watermark + 15m<br/>(repeat while ≤ ceiling)
+  end
+  loop each pending window
+    Job->>GDELT: GET {ts}.export / mentions / gkg zips
     Job->>EC: append_rows await Futures
-    Job->>WM: append_row offset_token=ts + wait_for_commit
+    Job->>WM: set watermark = ts (offset_token + wait_for_commit)
   end
 ```
 
@@ -54,64 +76,61 @@ sequenceDiagram
    ASYNC = TRUE` — the task finishes as soon as the job is accepted (~3–4s).
    Named jobs linger after `DONE`, so the DROP is required for the next run
    to recreate `GDELT_INCREMENTAL_JOB`.
-2. The container (`main.py`) reads the current watermark from a **standard**
-   Snowpipe Streaming channel's `latest_committed_offset_token`, fetches
-   [`lastupdate.txt`](http://data.gdeltproject.org/gdeltv2/lastupdate.txt) to
-   find the newest available 15-minute window, and walks the predictable
-   15-minute grid between the watermark and that window (capped by
-   `MAX_CATCHUP_WINDOWS` so a long outage doesn't trigger an unbounded
-   backfill in one run — any remaining gap closes gradually over subsequent
-   15-minute runs).
+2. The container (`main.py`) reads the watermark from a **standard** channel's
+   `latest_committed_offset_token`:
+   - **Cold start** (empty channel): ingest **only** the wall-clock ceiling
+     window (~last 15 minutes). No historical backfill.
+   - **Otherwise**: next window is **watermark + 15 minutes**. Catch-up is
+     successive `+15m` steps capped by `MAX_CATCHUP_WINDOWS`. A wall-clock
+     ceiling (`floor(UTC) − GDELT_LATEST_LAG_WINDOWS`) blocks unpublished
+     windows. Missing files return 404 and are skipped.
 3. For each pending window it downloads the three zips, decodes the
-   tab-delimited rows, and appends them via one **elastic channel per table**
-   (`StreamingIngestClient.get_elastic_channel()`), awaiting each append Future.
-4. After a window's elastic appends are acknowledged, the watermark is advanced
-   by appending a tiny row on the standard `gdelt_watermark` channel with
-   `offset_token=<YYYYMMDDHHMMSS>` and `wait_for_commit`, so a mid-run failure
-   resumes cleanly from the last fully-ingested window.
+   tab-delimited rows, and appends them via one **elastic channel per table**,
+   awaiting each append Future.
+4. After a window's elastic appends are acknowledged, the watermark is set to
+   **that window's timestamp** (`offset_token=<YYYYMMDDHHMMSS>` +
+   `wait_for_commit`). The next run starts at watermark + 15 minutes.
 5. The container closes its streaming clients and exits 0 — SPCS marks the job
    `DONE` (the serverless task already succeeded when the async job was accepted).
 
 ### Why a Task + `EXECUTE JOB SERVICE`, not a long-running `CREATE SERVICE`
 
 SPCS **jobs** (`EXECUTE JOB SERVICE`) run a container to completion and exit,
-which is the right fit for "do a batch of work every 15 minutes" — the
-compute pool only needs to be resumed while a job is actually running
-(`AUTO_SUSPEND_SECS` on the pool reclaims it between runs). A long-running
-`CREATE SERVICE` would need to build its own internal 15-minute scheduler
-loop and stay resident (and billed) the whole time for no benefit here.
+which fits "do a batch of work every 15 minutes" — the compute pool only needs
+to be resumed while a job is running (`AUTO_SUSPEND_SECS` reclaims it between
+runs). A long-running `CREATE SERVICE` would need its own scheduler and stay
+resident (and billed) the whole time for no benefit here.
 
 ### Auth: no private key needed in production
 
-Inside the SPCS job container, Snowflake automatically provides
-`SNOWFLAKE_ACCOUNT`/`SNOWFLAKE_HOST` and mounts a short-lived OAuth session
-token at `/snowflake/session/token`. `gdelt_incremental/config.py` detects
-this (`AUTHORIZATION_TYPE=SPCS`) and uses it for the Snowpipe Streaming SDK —
-so the running job needs **no secret, no key-pair, no password, and no
-warehouse**. Key-pair/password auth (`.env`) is only used for one-time local
-setup scripts.
+Inside the SPCS job container, Snowflake provides `SNOWFLAKE_ACCOUNT` /
+`SNOWFLAKE_HOST` and mounts a short-lived OAuth session token at
+`/snowflake/session/token`. `gdelt_incremental/config.py` detects this
+(`AUTHORIZATION_TYPE=SPCS`) — the running job needs **no secret, no key-pair,
+no password, and no warehouse**. Key-pair/password auth (`.env`) is only for
+one-time local setup scripts.
 
 ## Project layout
 
 ```
 gdelt_incremental/
-  config.py          Environment-driven settings + SPCS/JWT/password auth switch
+  config.py          Environment-driven settings + SPCS/JWT auth switch
   schemas.py          BigQuery-aligned column definitions + DDL helpers
-  gdelt_client.py      lastupdate.txt fetch, 15-minute window math, file download
-  row_encoder.py       Tab-delimited zip -> row dicts for append_rows()
+  gdelt_client.py      watermark+15m windows, URL construction, download
+  row_encoder.py       Tab-delimited zip → row dicts for append_rows()
   watermark.py         Standard-channel offset-token get/set (no warehouse SQL)
-  ingest.py             One incremental cycle: discover -> stream -> advance watermark
-main.py                 Entrypoint: run_once() then exit (the job's whole lifecycle)
+  ingest.py             One cycle: next window(s) → stream → set watermark
+main.py                 Entrypoint: run_once() then exit
 sql/
   setup_snowflake.sql    Database/schema/compute pool/image repo/EAI/grants
-  create_task.sql         CREATE TASK ... AS EXECUTE JOB SERVICE ... (every 15 min)
+  create_task.sql         CREATE TASK … AS EXECUTE JOB SERVICE … (every 15 min)
 spcs/
   job_spec.yaml           SPCS job container spec (templated)
 scripts/
   setup_snowflake_keypair.py  One-time: register an RSA key for local/dev auth
-  create_gdelt_tables.py      One-time: create EVENTS/EVENTMENTIONS/GKG + pipes + WM sink
+  create_gdelt_tables.py      Drop+recreate tables/pipes (full reset) + WM sink
   render_sql.py               Fill in sql/*.sql placeholders from .env
-  deploy.sh                   Build/push the image, render + upload the job spec
+  deploy.sh                   Build/push the image, render job spec
 ```
 
 ## Quick start
@@ -132,8 +151,8 @@ python scripts/render_sql.py
 # Review sql/setup_snowflake.rendered.sql, then run it (Snowsight, SnowSQL, or `snow sql -f`)
 ```
 
-This creates the database/schema, a 1-node compute pool, an image repository,
-a stage, and the network rule/external access integration for outbound GDELT +
+Creates the database/schema, a 1-node compute pool, an image repository, a
+stage, and the network rule / external access integration for outbound GDELT +
 Snowflake ingest traffic.
 
 ### 3. Register a key pair and create tables (local dev auth)
@@ -143,10 +162,11 @@ python scripts/setup_snowflake_keypair.py --write-env
 python scripts/create_gdelt_tables.py
 ```
 
-Creates `EVENTS`, `EVENTMENTIONS`, `GKG` (with `ROW_TIMESTAMP = TRUE`), their
-`MATCH_BY_COLUMN_NAME` Snowpipe Streaming pipes, and the `GDELT_WATERMARK`
-streaming sink + pipe. Progress is stored as the `gdelt_watermark` channel's
-offset token (the sink table is only the pipe COPY target).
+**Drops and recreates** `EVENTS`, `EVENTMENTIONS`, `GKG`, `GDELT_WATERMARK`,
+and their `MATCH_BY_COLUMN_NAME` pipes (clears streaming channel offset tokens
+too). Progress lives on the `gdelt_watermark` channel offset token; the sink
+table is only the pipe COPY target. Omit `SEED_WATERMARK_TIMESTAMP` so the
+first job cold-starts from the latest ~15-minute window only.
 
 ### 4. Try one cycle locally (optional, uses key-pair auth from `.env`)
 
@@ -154,8 +174,8 @@ offset token (the sink table is only the pipe COPY target).
 python main.py
 ```
 
-First run ingests only the latest published window (no backfill by design);
-subsequent runs pick up from the watermark.
+First run with an empty watermark ingests only the ceiling window (~last 15
+minutes). Later runs take watermark + 15 minutes.
 
 ### 5. Build, push, and deploy to SPCS
 
@@ -164,8 +184,9 @@ chmod +x scripts/deploy.sh
 ./scripts/deploy.sh
 ```
 
-Builds the image, pushes it to the Snowflake image repository, and renders +
-uploads `spcs/job_spec.yaml` to the stage.
+Builds the image, pushes it to the Snowflake image repository, and renders
+`spcs/job_spec.rendered.yaml`. Then `PUT` that file to the stage (see script
+output) and apply `sql/create_task.rendered.sql`.
 
 ### 6. Schedule the job every 15 minutes
 
@@ -174,8 +195,7 @@ python scripts/render_sql.py   # if not already run
 # Review sql/create_task.rendered.sql, then run it
 ```
 
-This creates and resumes `GDELT_INCREMENTAL_TASK`. To run it once immediately
-instead of waiting for the schedule:
+Creates and resumes `GDELT_INCREMENTAL_TASK`. To run once immediately:
 
 ```sql
 EXECUTE TASK <database>.GDELT.GDELT_INCREMENTAL_TASK;
@@ -194,16 +214,28 @@ CALL SYSTEM$GET_SERVICE_LOGS('<database>.GDELT.GDELT_INCREMENTAL_JOB', 0, 'gdelt
 -- Sink rows (audit only; source of truth is the channel offset token)
 SELECT * FROM <database>.GDELT.GDELT_WATERMARK ORDER BY LAST_TIMESTAMP DESC LIMIT 20;
 
+-- Windows actually loaded
+SELECT "_GDELT_TIMESTAMP", COUNT(*) FROM <database>.GDELT.EVENTS GROUP BY 1 ORDER BY 1;
+
 -- Pause / resume the 15-minute schedule
 ALTER TASK <database>.GDELT.GDELT_INCREMENTAL_TASK SUSPEND;
 ALTER TASK <database>.GDELT.GDELT_INCREMENTAL_TASK RESUME;
+```
+
+### Reset everything (empty tables + clear watermark)
+
+```bash
+set -a && source .env && set +a
+python scripts/create_gdelt_tables.py   # DROP + recreate tables/pipes
+./scripts/deploy.sh                     # rebuild/push if code changed
+# PUT job_spec + EXECUTE TASK …
 ```
 
 ### Ingest latency
 
 Same convention as `../streaming_gdelt`: `client_ts_ms` is set when the job
 appends a row, and `ROW_TIMESTAMP = TRUE` lets you compare it to Snowflake's
-own commit time.
+commit time.
 
 ```sql
 SELECT
@@ -223,29 +255,27 @@ LIMIT 100;
 ## Configuration reference
 
 | Variable | Default | Description |
-|----------|---------|--------------|
+|----------|---------|-------------|
 | `SNOWFLAKE_DATABASE` | *(required)* | Target database |
 | `SNOWFLAKE_SCHEMA` | `GDELT` | Dedicated schema for all objects |
-| `SNOWFLAKE_WAREHOUSE` | *(optional)* | Only for local setup scripts, not the job |
+| `SNOWFLAKE_WAREHOUSE` | *(optional)* | Local setup scripts only, not the job |
 | `SNOWFLAKE_ROLE` | `GDELT_LOADER_ROLE` | Role the job/task run as |
 | `SNOWFLAKE_TABLE_EVENTS` / `_MENTIONS` / `_GKG` | `EVENTS` / `EVENTMENTIONS` / `GKG` | Target table names |
 | `SNOWFLAKE_WATERMARK_TABLE` | `GDELT_WATERMARK` | Streaming sink for watermark rows |
-| `SNOWFLAKE_WATERMARK_CHANNEL` | `gdelt_watermark` | Standard channel whose offset token is progress |
-| `LASTUPDATE_URL` | GDELT `lastupdate.txt` | Incremental index source |
-| `GDELT_BASE_URL` | `http://data.gdeltproject.org/gdeltv2` | Base URL for constructing per-window file URLs |
+| `SNOWFLAKE_WATERMARK_CHANNEL` | `gdelt_watermark` | Standard channel; offset token = progress |
+| `GDELT_BASE_URL` | `http://data.gdeltproject.org/gdeltv2` | Base URL for per-window file URLs |
+| `GDELT_LATEST_LAG_WINDOWS` | `1` | Completed windows behind wall-clock used as ceiling |
 | `BATCH_SIZE` | `1000` | Rows per `append_rows()` call |
-| `MAX_CATCHUP_WINDOWS` | `8` | Max 15-minute windows caught up on in a single run |
+| `MAX_CATCHUP_WINDOWS` | `8` | Max `+15m` catch-up windows per job run |
+| `SEED_WATERMARK_TIMESTAMP` | *(unset)* | Optional seed after recreate; omit for cold start |
 | `APPEND_ROWS_MAX_RETRIES` | `5` | Retries for retryable Snowpipe Streaming errors |
-| `AUTHORIZATION_TYPE` | auto-detected | `SPCS` (in-container), `JWT` (key-pair), or unset to auto-detect |
+| `AUTHORIZATION_TYPE` | auto-detected | `SPCS` (in-container), `JWT` (key-pair), or unset |
 
 ## Caveats / at-least-once semantics
 
-If the job process crashes *after* successfully appending a window's rows
-but *before* the watermark offset token commits (`wait_for_commit`), the next
-run will re-ingest that same window, producing duplicate rows (each row still
-carries `_GDELT_TIMESTAMP` and the original `GLOBALEVENTID`/`GKGRECORDID`, so
-downstream de-duplication is straightforward, e.g. `QUALIFY
-ROW_NUMBER() OVER (PARTITION BY GLOBALEVENTID ORDER BY client_ts_ms DESC) = 1`
-on `EVENTS`). This mirrors the semantics of the underlying Snowpipe Streaming
-SDK and was chosen over more complex exactly-once bookkeeping to keep the job
-simple enough to reason about at a 15-minute cadence.
+If the job crashes *after* appending a window's rows but *before* the watermark
+offset token commits (`wait_for_commit`), the next run re-ingests that window
+(duplicate rows). Each row still carries `_GDELT_TIMESTAMP` and
+`GLOBALEVENTID` / `GKGRECORDID`, so downstream de-duplication is straightforward,
+e.g. `QUALIFY ROW_NUMBER() OVER (PARTITION BY GLOBALEVENTID ORDER BY client_ts_ms DESC) = 1`
+on `EVENTS`.

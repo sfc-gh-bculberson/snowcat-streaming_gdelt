@@ -34,7 +34,10 @@ AUTHORIZATION_TYPE = os.getenv("AUTHORIZATION_TYPE", "").strip().upper()
 SPCS_TOKEN_PATH = os.getenv("SPCS_TOKEN_PATH", "/snowflake/session/token")
 
 GDELT_BASE_URL = os.getenv("GDELT_BASE_URL", "http://data.gdeltproject.org/gdeltv2")
-LASTUPDATE_URL = os.getenv("LASTUPDATE_URL", f"{GDELT_BASE_URL}/lastupdate.txt")
+# How many completed 15-minute windows behind wall-clock to treat as the ingest
+# ceiling. Avoids racing a window GDELT has not published yet (we do not use
+# lastupdate.txt, which can lag or omit files).
+GDELT_LATEST_LAG_WINDOWS = int(os.getenv("GDELT_LATEST_LAG_WINDOWS", "1"))
 
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1000"))
 DATA_DIR = Path(os.getenv("DATA_DIR", "/tmp/gdelt"))

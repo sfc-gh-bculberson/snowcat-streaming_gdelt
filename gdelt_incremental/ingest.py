@@ -1,8 +1,10 @@
-"""One incremental GDELT ingest cycle: discover new 15-minute windows since the
-watermark, stream their rows into Snowflake via Snowpipe Streaming, and
-advance the watermark. Designed to run to completion and exit -- this is the
-function invoked by main.py, which is what the SPCS job container runs every
-time the Snowflake Task fires it (every 15 minutes).
+"""One incremental GDELT ingest cycle.
+
+Reads the watermark offset token, takes the next window as watermark + 15
+minutes (or, on cold start with an empty watermark, only the wall-clock
+ceiling ≈ last 15 minutes), streams that window's rows via Snowpipe Streaming,
+and sets the watermark to that window's timestamp. Invoked by main.py — the
+SPCS job container entrypoint run every 15 minutes by the Snowflake Task.
 
 Watermark state lives on a *standard* channel offset token (see
 ``gdelt_incremental.watermark``); EVENTS/MENTIONS/GKG use elastic channels.
@@ -125,22 +127,18 @@ def run_once() -> int:
         wm_channel = wm.open_channel(wm_client)
         last_watermark = wm.get_watermark(wm_channel)
 
-        lastupdate_files = gdelt_client.fetch_lastupdate()
-        latest = gdelt_client.latest_timestamp(lastupdate_files)
-        if latest is None:
-            logger.error("lastupdate.txt returned no parseable files; aborting run")
-            raise RuntimeError("Could not determine latest GDELT timestamp")
-
-        windows = gdelt_client.pending_timestamps(last_watermark, latest)
+        # Next window is always watermark + 15m (ceiling only blocks the future).
+        ceiling = gdelt_client.ingest_ceiling()
+        windows = gdelt_client.pending_timestamps(last_watermark, ceiling)
         if not windows:
-            logger.info("Up to date: watermark=%s latest=%s", last_watermark, latest)
+            logger.info("Up to date: watermark=%s ceiling=%s", last_watermark, ceiling)
             return 0
 
         logger.info(
-            "Watermark=%s latest=%s -> %d window(s) to ingest: %s",
+            "Watermark=%s -> %d window(s) via +15m (ceiling=%s): %s",
             last_watermark,
-            latest,
             len(windows),
+            ceiling,
             windows,
         )
 
@@ -160,8 +158,9 @@ def run_once() -> int:
                     totals["gkg"],
                 )
                 # Elastic append Futures are awaited in _append_batch_with_retry
-                # (wait_for_flush is not supported on elastic channels). Advance
-                # the standard-channel offset token only after those acks.
+                # (wait_for_flush is not supported on elastic channels). Set the
+                # standard-channel offset token to this window's timestamp only
+                # after those acks — next run starts at ts + 15 minutes.
                 wm.set_watermark(wm_channel, ts)
                 completed += 1
         finally:

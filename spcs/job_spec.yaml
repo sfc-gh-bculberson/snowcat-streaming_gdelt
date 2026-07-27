@@ -19,6 +19,7 @@ spec:
         SNOWFLAKE_CLIENT_NAME: gdelt-incremental
         BATCH_SIZE: "1000"
         MAX_CATCHUP_WINDOWS: "8"
+        GDELT_LATEST_LAG_WINDOWS: "1"
         DATA_DIR: /tmp/gdelt
       resources:
         requests:
