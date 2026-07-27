@@ -1,10 +1,9 @@
 """Environment-variable-driven configuration.
 
-Auth pattern mirrors ../streaming_gdelt/gdelt/config.py: inside an SPCS job the
-container automatically gets SNOWFLAKE_ACCOUNT / SNOWFLAKE_HOST env vars and an
-OAuth token mounted at /snowflake/session/token, so no secret or private key is
-needed in production. Locally (or for one-time setup scripts) key-pair (JWT) or
-password auth via .env is used instead.
+Inside an SPCS job the container automatically gets SNOWFLAKE_ACCOUNT /
+SNOWFLAKE_HOST env vars and an OAuth token mounted at /snowflake/session/token,
+so no secret or private key is needed in production. Locally (or for one-time
+setup scripts) key-pair (JWT) or password auth via .env is used instead.
 """
 
 from __future__ import annotations

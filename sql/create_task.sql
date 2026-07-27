@@ -5,7 +5,8 @@
 -- Each job run advances from the gdelt_watermark channel offset token:
 --   cold start (empty) → ingest only the latest ~15-minute window
 --   otherwise          → watermark + 15 minutes (catch-up capped)
--- Watermark is set to each completed window's YYYYMMDDHHMMSS. No warehouse SQL.
+-- Watermark is set to each completed window's YYYYMMDDHHMMSS.
+-- Tracking progress on the streaming channel offset token avoids warehouse use.
 --
 -- This is a *serverless* task (no WAREHOUSE=): Snowflake-managed compute runs
 -- the DROP + EXECUTE JOB SERVICE statements. Prefer ASYNC=TRUE so the task

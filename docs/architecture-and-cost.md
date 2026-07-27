@@ -55,8 +55,7 @@ flowchart TB
 
 Progress is entirely watermark-driven. File URLs are constructed from the
 15-minute timestamp — **no** `lastupdate.txt` and **no** `masterfilelist.txt`
-(those indexes can lag or omit windows; the bulk loader in `../streaming_gdelt`
-uses the masterfilelist for historical backfill instead).
+(those indexes can lag or omit windows).
 
 ```mermaid
 flowchart TD
@@ -123,8 +122,8 @@ sequenceDiagram
 | EVENTS / EVENTMENTIONS / GKG | **Elastic** | `*_MATCH_BY_COLUMN` → fact tables | Row payload only (no offset tokens) |
 | Watermark | **Standard** (`gdelt_watermark`) | `GDELT_WATERMARK_MATCH_BY_COLUMN` → sink | `latest_committed_offset_token` = last ingested `YYYYMMDDHHMMSS` |
 
-The sink table exists only because a streaming pipe needs a COPY target. The
-loader never runs warehouse SQL to read or write watermark state.
+The sink table exists only because a streaming pipe needs a COPY target.
+Tracking progress on the streaming channel offset token avoids warehouse use.
 
 ### Runtime loop (every 15 minutes)
 
@@ -136,7 +135,8 @@ loader never runs warehouse SQL to read or write watermark state.
    resume carries a **5-minute platform-credit minimum** per the consumption
    table).
 3. Container authenticates with the mounted SPCS session token — no private
-   key and **no warehouse**.
+   key. Tracking progress on the streaming channel offset token avoids
+   warehouse use.
 4. Opens standard channel `gdelt_watermark`, reads
    `get_latest_committed_offset_token()`:
    - empty → cold start: **one** ceiling window (~last 15 minutes)
@@ -153,8 +153,8 @@ loader never runs warehouse SQL to read or write watermark state.
 A `CREATE SERVICE` that slept between windows would keep the compute-pool node
 **IDLE/ACTIVE 24×7** (~720 hours × 0.06 cr/hr ≈ **43 credits/month** for SPCS
 alone). The job model only bills while the node is up around each 15-minute
-run. Tracking progress on a streaming channel offset token also removes the
-former **`QUERY_WAREHOUSE` 60-second resume tax** (~$144/month at list).
+run. Tracking progress on a streaming channel offset token avoids warehouse
+use.
 
 ## Volume baseline (measured)
 
@@ -208,7 +208,7 @@ Assumptions aligned with the deployed objects:
 - Job wall time ~1 minute of ACTIVE work once the node is up
 - `AUTO_SUSPEND_SECS = 300` → ~5 minutes IDLE after each job before suspend
 - Billed SPCS time per cycle ≈ `max(5 min resume minimum, 1 + 5) = **6 minutes**`
-- **No warehouse** for watermark (standard-channel offset token)
+- Watermark progress via streaming channel offset token (avoids warehouse use)
 - Ingest = 76 GB/month uncompressed NDJSON at 0.0037 cr/GB
 
 | Cost center | Formula | Credits / mo | $ / mo @ $3/cr | Share |
@@ -237,8 +237,8 @@ above. Cloud Services usually stays under the 10% daily warehouse allowance.
 
 **Ingest is negligible** (~$1/month). Almost all spend is the **SPCS
 5-minute resume minimum** every 15 minutes, then a small serverless-task
-charge for DROP/EXECUTE. Removing warehouse SQL for the watermark cut the
-previous ~$144/month `QUERY_WAREHOUSE` term.
+charge for DROP/EXECUTE. Tracking progress on a streaming channel offset
+token avoids warehouse use.
 
 ## Optimization levers (ranked)
 
@@ -295,7 +295,7 @@ WHERE STATE = 'SUCCEEDED';
 | Compute pool | `GDELT_INCREMENTAL_POOL` (`CPU_X64_XS`) |
 | Image | `.../gdelt_loader_repo/gdelt-incremental:latest` |
 | Job | `GDELT_INCREMENTAL_JOB` |
-| Task | `GDELT_INCREMENTAL_TASK` (serverless, `15 MINUTE`, `ASYNC`, no `QUERY_WAREHOUSE`) |
+| Task | `GDELT_INCREMENTAL_TASK` (serverless, `15 MINUTE`, `ASYNC`) |
 | EAI | `gdelt_public_access` |
 | Ingress rule | `SC_DB.SC_SCHEMA.GDELT_LOADER_POOL_INGRESS` |
 

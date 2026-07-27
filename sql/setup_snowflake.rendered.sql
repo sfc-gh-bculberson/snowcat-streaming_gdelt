@@ -74,8 +74,7 @@ GRANT EXECUTE MANAGED TASK ON ACCOUNT TO ROLE ACCOUNTADMIN;
 GRANT ROLE ACCOUNTADMIN TO USER SC_ADMINUSER;
 
 -- If the account has a restrictive NETWORK POLICY, allow this compute pool to
--- call Snowflake APIs (Snowpipe Streaming ingest) from SPCS. Same pattern as
--- streaming_gdelt's _ensure_spcs_network_policy:
+-- call Snowflake APIs (Snowpipe Streaming ingest) from SPCS:
 --
 --   CREATE NETWORK RULE IF NOT EXISTS SC_DB.SC_SCHEMA.GDELT_LOADER_POOL_INGRESS
 --     TYPE = COMPUTE_POOL MODE = INGRESS
@@ -85,7 +84,7 @@ GRANT ROLE ACCOUNTADMIN TO USER SC_ADMINUSER;
 --
 -- Run scripts/create_gdelt_tables.py next to create EVENTS/EVENTMENTIONS/GKG,
 -- their Snowpipe Streaming pipes, and the GDELT_WATERMARK streaming sink
--- (progress is a standard-channel offset token, not warehouse SQL).
+-- (progress is a standard-channel offset token — avoids warehouse use).
 --
 -- After pushing the container image and uploading spcs/job_spec.yaml to the
 -- stage, run sql/create_task.sql to schedule the job every 15 minutes.

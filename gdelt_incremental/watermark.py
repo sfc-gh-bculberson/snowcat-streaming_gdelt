@@ -4,8 +4,8 @@ Progress is the channel's ``latest_committed_offset_token`` (a GDELT
 ``YYYYMMDDHHMMSS`` string). On each completed window we ``append_row`` a tiny
 payload with that timestamp as ``offset_token`` and ``wait_for_commit``.
 
-The destination table exists only because a streaming pipe needs a COPY target;
-the loader never runs warehouse SQL to read or write watermark state.
+The destination table exists only because a streaming pipe needs a COPY target.
+Tracking progress on the channel offset token avoids warehouse use.
 """
 
 from __future__ import annotations

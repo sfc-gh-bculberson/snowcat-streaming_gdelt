@@ -1,6 +1,5 @@
 """GDELT 2.0 table schemas, aligned with the Google BigQuery gdelt-bq.gdeltv2
-column layout (same layout used by ../streaming_gdelt for the bulk loader, so
-EVENTS/EVENTMENTIONS/GKG stay compatible across both loaders)."""
+column layout."""
 
 from __future__ import annotations
 
@@ -166,8 +165,7 @@ FILENAME_SUFFIXES: Dict[TableKind, str] = {
 
 # Ingest lineage columns appended to every table (not present in the raw GDELT
 # files). "_GDELT_TIMESTAMP" is the 15-minute window the row came from;
-# "client_ts_ms" mirrors the ROW_TIMESTAMP convention used by ../streaming_gdelt
-# so ingest-latency queries work the same way against either loader's tables.
+# "client_ts_ms" supports ingest-latency queries with ROW_TIMESTAMP = TRUE.
 LINEAGE_COLUMNS: Tuple[ColumnSpec, ...] = (
     ColumnSpec("_GDELT_TIMESTAMP", "STRING"),
     ColumnSpec("client_ts_ms", "INTEGER"),

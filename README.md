@@ -7,13 +7,10 @@ own 15-minute publish cadence. Each run pulls the next `events` / `mentions` /
 `gkg` window after the last watermark and streams rows into Snowflake with the
 **Snowpipe Streaming SDK for Python** (`snowpipe-streaming`).
 
-This is a lean companion to [`../streaming_gdelt`](../streaming_gdelt) (a
-Locust-based *bulk historical* loader) and reuses its Snowflake object
-conventions (row schema, `ROW_TIMESTAMP` latency tracking,
-`MATCH_BY_COLUMN_NAME` pipes) and SPCS patterns from
-[`../snowcat-elastic_channels`](../snowcat-elastic_channels). There is no
-Locust, no Rust encoder, and no long-running service — just a small container
-that runs one ingest cycle and exits.
+Tables use BigQuery-aligned `gdeltv2` columns plus `ROW_TIMESTAMP` /
+`client_ts_ms` for ingest-latency tracking, and `MATCH_BY_COLUMN_NAME`
+Snowpipe Streaming pipes. There is no long-running service — just a small
+container that runs one ingest cycle and exits.
 
 ## Architecture & cost
 
@@ -107,7 +104,8 @@ Inside the SPCS job container, Snowflake provides `SNOWFLAKE_ACCOUNT` /
 `SNOWFLAKE_HOST` and mounts a short-lived OAuth session token at
 `/snowflake/session/token`. `gdelt_incremental/config.py` detects this
 (`AUTHORIZATION_TYPE=SPCS`) — the running job needs **no secret, no key-pair,
-no password, and no warehouse**. Key-pair/password auth (`.env`) is only for
+and no password**. Tracking progress on a streaming channel offset token
+avoids warehouse use. Key-pair/password auth (`.env`) is only for
 one-time local setup scripts.
 
 ## Project layout
@@ -118,7 +116,7 @@ gdelt_incremental/
   schemas.py          BigQuery-aligned column definitions + DDL helpers
   gdelt_client.py      watermark+15m windows, URL construction, download
   row_encoder.py       Tab-delimited zip → row dicts for append_rows()
-  watermark.py         Standard-channel offset-token get/set (no warehouse SQL)
+  watermark.py         Standard-channel offset-token get/set (avoids warehouse use)
   ingest.py             One cycle: next window(s) → stream → set watermark
 main.py                 Entrypoint: run_once() then exit
 sql/
@@ -233,9 +231,8 @@ python scripts/create_gdelt_tables.py   # DROP + recreate tables/pipes
 
 ### Ingest latency
 
-Same convention as `../streaming_gdelt`: `client_ts_ms` is set when the job
-appends a row, and `ROW_TIMESTAMP = TRUE` lets you compare it to Snowflake's
-commit time.
+`client_ts_ms` is set when the job appends a row, and `ROW_TIMESTAMP = TRUE`
+lets you compare it to Snowflake's commit time.
 
 ```sql
 SELECT

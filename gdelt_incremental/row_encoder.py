@@ -1,10 +1,8 @@
 """Tab-delimited GDELT zip files -> row dicts for Snowpipe Streaming.
 
 GDELT files have a ``.csv``/``.CSV`` extension but are actually tab-delimited
-with no header row. This is a deliberately simple, pure-Python encoder (no
-Rust extension, unlike ../streaming_gdelt's bulk loader) since a single
-15-minute incremental trio is a few tens of thousands of rows at most --
-nowhere near the throughput that justified the native encoder there.
+with no header row. Pure-Python encoder is enough here: a single 15-minute
+incremental trio is a few tens of thousands of rows at most.
 """
 
 from __future__ import annotations
