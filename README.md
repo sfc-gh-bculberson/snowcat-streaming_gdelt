@@ -120,7 +120,7 @@ gdelt_incremental/
   ingest.py             One cycle: next window(s) → stream → set watermark
 main.py                 Entrypoint: run_once() then exit
 sql/
-  setup_snowflake.sql    Database/schema/compute pool/image repo/EAI/grants
+  setup_snowflake.sql    Database/schema/image repo/EAI/grants (uses existing pool)
   create_task.sql         CREATE TASK … AS EXECUTE JOB SERVICE … (every 15 min)
 spcs/
   job_spec.yaml           SPCS job container spec (templated)
@@ -149,9 +149,10 @@ python scripts/render_sql.py
 # Review sql/setup_snowflake.rendered.sql, then run it (Snowsight, SnowSQL, or `snow sql -f`)
 ```
 
-Creates the database/schema, a 1-node compute pool, an image repository, a
-stage, and the network rule / external access integration for outbound GDELT +
-Snowflake ingest traffic.
+Creates the database/schema, an image repository, a stage, and the network
+rule / external access integration for outbound GDELT + Snowflake ingest
+traffic. SPCS jobs use the existing account pool `SYSTEM_COMPUTE_POOL_CPU`
+(no dedicated pool is created).
 
 ### 3. Register a key pair and create tables (local dev auth)
 

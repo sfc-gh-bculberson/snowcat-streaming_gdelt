@@ -37,7 +37,7 @@ PLACEHOLDERS = {
     "<role>": lambda: os.getenv("SNOWFLAKE_ROLE", "GDELT_LOADER_ROLE"),
     "<user>": lambda: os.getenv("SNOWFLAKE_USER", ""),
     "<warehouse>": lambda: os.getenv("SNOWFLAKE_WAREHOUSE", "GDELT_LOADER_WH"),
-    "<compute_pool>": lambda: os.getenv("SPCS_COMPUTE_POOL", "GDELT_INCREMENTAL_POOL"),
+    "<compute_pool>": lambda: os.getenv("SPCS_COMPUTE_POOL", "SYSTEM_COMPUTE_POOL_CPU"),
     "<image_repo>": lambda: os.getenv("SPCS_IMAGE_REPO", "GDELT_LOADER_REPO"),
     "<stage>": lambda: os.getenv("SPCS_STAGE", "GDELT_STAGE"),
     "<job_name>": lambda: os.getenv("SPCS_JOB_NAME", "GDELT_INCREMENTAL_JOB"),

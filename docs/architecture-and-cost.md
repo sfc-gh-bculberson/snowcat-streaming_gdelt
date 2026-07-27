@@ -20,7 +20,7 @@ for actual runtime — no 60-second warehouse floor on the task itself).
 flowchart TB
   subgraph Snowflake["Snowflake account"]
     Task["Task GDELT_INCREMENTAL_TASK<br/>serverless · 15 MIN · ASYNC"]
-    Pool["Compute pool GDELT_INCREMENTAL_POOL<br/>CPU_X64_XS · MIN/MAX = 1<br/>AUTO_SUSPEND_SECS = 300"]
+    Pool["Compute pool SYSTEM_COMPUTE_POOL_CPU<br/>existing account pool · shared"]
     Job["Job GDELT_INCREMENTAL_JOB<br/>gdelt-incremental container"]
 
     subgraph Streaming["Snowpipe Streaming"]
@@ -131,9 +131,9 @@ Tracking progress on the streaming channel offset token avoids warehouse use.
    jobs linger and otherwise block recreate), then `EXECUTE JOB SERVICE …
    ASYNC = TRUE`. Task run finishes in a few seconds once the job is accepted
    (measured ~3–4s).
-2. Compute pool resumes from `SUSPENDED` if needed (`STARTING` is not billed;
-   resume carries a **5-minute platform-credit minimum** per the consumption
-   table).
+2. Compute pool `SYSTEM_COMPUTE_POOL_CPU` (existing account pool) accepts the
+   job; resume/start behavior follows that pool's settings. SPCS usage is
+   billed while the job's containers run.
 3. Container authenticates with the mounted SPCS session token — no private
    key. Tracking progress on the streaming channel offset token avoids
    warehouse use.
@@ -145,16 +145,14 @@ Tracking progress on the streaming channel offset token avoids warehouse use.
 5. For each pending window: download export/mentions/gkg → decode →
    `append_rows` on three elastic channels (await Futures) → **set watermark
    to that window's timestamp** (`offset_token=<ts>` + `wait_for_commit`).
-6. Container exits 0; pool idles until `AUTO_SUSPEND_SECS` (300s today), then
-   suspends.
+6. Container exits 0; SPCS marks the job `DONE`.
 
 ### Why this shape is cheap vs a long-running service
 
-A `CREATE SERVICE` that slept between windows would keep the compute-pool node
-**IDLE/ACTIVE 24×7** (~720 hours × 0.06 cr/hr ≈ **43 credits/month** for SPCS
-alone). The job model only bills while the node is up around each 15-minute
-run. Tracking progress on a streaming channel offset token avoids warehouse
-use.
+A `CREATE SERVICE` that slept between windows would keep SPCS nodes
+**IDLE/ACTIVE 24×7**. The job model only bills while containers run around
+each 15-minute cycle. Tracking progress on a streaming channel offset token
+avoids warehouse use.
 
 ## Volume baseline (measured)
 
@@ -193,8 +191,8 @@ volume; treat ±50% as a reasonable band for busy/quiet months.
 
 | Component | Rate | Source |
 |-----------|------|--------|
-| SPCS `CPU_X64_XS` | **0.06** platform credits / node-hour | Consumption Table – SPCS first-gen |
-| SPCS resume minimum | **5 minutes** of credits per start/resume | Consumption Table preamble |
+| SPCS (system CPU pool usage) | per node family on `SYSTEM_COMPUTE_POOL_CPU` (`CPU_X64_S` today) | Consumption Table – SPCS |
+| SPCS resume minimum | **5 minutes** of credits per start/resume (when applicable) | Consumption Table preamble |
 | Serverless Task | **~1.5×** warehouse-equivalent for *actual* runtime | Consumption Table – Serverless Task |
 | Snowpipe Streaming (HP / SSv2) | **0.0037** credits / uncompressed GB | Consumption Table – Snowpipe Streaming |
 | Platform credit $ (Enterprise OD) | **$3.00** / credit | Typical US AWS on-demand list |
@@ -203,17 +201,17 @@ volume; treat ±50% as a reasonable band for busy/quiet months.
 
 Assumptions aligned with the deployed objects:
 
+- Jobs run on the existing **`SYSTEM_COMPUTE_POOL_CPU`** (shared; no dedicated pool)
 - 2,880 job runs/month (exactly one 15-minute window each, no catch-up backlog)
 - Serverless task body ~**4 seconds** (DROP + async EXECUTE accept)
-- Job wall time ~1 minute of ACTIVE work once the node is up
-- `AUTO_SUSPEND_SECS = 300` → ~5 minutes IDLE after each job before suspend
-- Billed SPCS time per cycle ≈ `max(5 min resume minimum, 1 + 5) = **6 minutes**`
+- Job wall time ~1 minute of ACTIVE work once a node is available
+- Illustrative SPCS billing ≈ `max(5 min resume minimum, ~1 min active)` per cycle when the pool resumes for this job alone — shared-pool reality may be lower if other workloads keep nodes warm
 - Watermark progress via streaming channel offset token (avoids warehouse use)
 - Ingest = 76 GB/month uncompressed NDJSON at 0.0037 cr/GB
 
 | Cost center | Formula | Credits / mo | $ / mo @ $3/cr | Share |
 |-------------|---------|--------------|----------------|-------|
-| **SPCS compute pool** | 2,880 × 6 min × 0.06 cr/hr | **17.3** | **$52** | 77% |
+| **SPCS (`SYSTEM_COMPUTE_POOL_CPU`)** | 2,880 × 6 min × 0.06 cr/hr | **17.3** | **$52** | 77% |
 | **Serverless task** | 2,880 × 4s × 1.5 × 1.0 cr/hr | **4.8** | **$14** | 21% |
 | **Snowpipe Streaming ingest** | 76 GB × 0.0037 | **0.28** | **$0.84** | 1% |
 | **Total** | | **~22.4** | **~$67** | 100% |
@@ -227,11 +225,11 @@ above. Cloud Services usually stays under the 10% daily warehouse allowance.
 
 | Scenario | SPCS cr | Serverless cr | Ingest cr | Total $ |
 |----------|---------|---------------|-----------|---------|
-| Current (`AUTO_SUSPEND=300`) | 17.3 | 4.8 | 0.28 | **~$67** |
-| `AUTO_SUSPEND_SECS=60` (5-min SPCS floor still binds) | 14.4 | 4.8 | 0.28 | **~$58** |
+| Illustrative (6 min billed / cycle) | 17.3 | 4.8 | 0.28 | **~$67** |
+| Warm shared pool (~1 min active only) | 2.9 | 4.8 | 0.28 | **~$24** |
 | Quiet news month (−50% GKG bytes) | 17.3 | 4.8 | 0.14 | **~$67** |
 | Busy news month (+50% GKG bytes) | 17.3 | 4.8 | 0.42 | **~$68** |
-| Always-on `CREATE SERVICE` instead of jobs | ~43 | 0 | 0.28 | **~$130+** |
+| Always-on `CREATE SERVICE` instead of jobs | high | 0 | 0.28 | **higher** |
 
 ### What actually dominates cost
 
@@ -242,10 +240,10 @@ token avoids warehouse use.
 
 ## Optimization levers (ranked)
 
-1. **`AUTO_SUSPEND_SECS = 60`** on `GDELT_INCREMENTAL_POOL` — shaves ~1 minute
-   of IDLE off each cycle; limited by the 5-minute resume floor (~$9/month).
-2. **Do not** move to a long-running service for cost reasons; idle SPCS alone
-   is ~$130/month at list.
+1. Prefer jobs over a long-running `CREATE SERVICE` so SPCS only runs while
+   each 15-minute window is ingested.
+2. Keep catch-up caps (`MAX_CATCHUP_WINDOWS`) tight so a backlog cannot stretch
+   a single job into a long ACTIVE period on the shared pool.
 
 ## How to verify against the bill
 
@@ -292,12 +290,12 @@ WHERE STATE = 'SUCCEEDED';
 | Fact pipes | `EVENTS_MATCH_BY_COLUMN`, `EVENTMENTIONS_MATCH_BY_COLUMN`, `GKG_MATCH_BY_COLUMN` |
 | Watermark pipe | `GDELT_WATERMARK_MATCH_BY_COLUMN` |
 | Watermark channel | `gdelt_watermark` (offset token = progress) |
-| Compute pool | `GDELT_INCREMENTAL_POOL` (`CPU_X64_XS`) |
+| Compute pool | `SYSTEM_COMPUTE_POOL_CPU` (`CPU_X64_S`, existing; not created by this project) |
 | Image | `.../gdelt_loader_repo/gdelt-incremental:latest` |
 | Job | `GDELT_INCREMENTAL_JOB` |
 | Task | `GDELT_INCREMENTAL_TASK` (serverless, `15 MINUTE`, `ASYNC`) |
 | EAI | `gdelt_public_access` |
-| Ingress rule | `SC_DB.SC_SCHEMA.GDELT_LOADER_POOL_INGRESS` |
+| Ingress rule | `SC_DB.SC_SCHEMA.GDELT_LOADER_POOL_INGRESS` (includes `SYSTEM_COMPUTE_POOL_CPU`) |
 
 ### Reset inventory
 

@@ -3,8 +3,9 @@
 -- placeholders (<...>) before running, or use scripts/render_sql.py
 -- which renders this file from your .env.
 --
--- All GDELT objects (tables, pipes, watermark streaming sink, compute pool,
--- image repository, task) live in the dedicated SC_DB.GDELT schema.
+-- All GDELT objects (tables, pipes, watermark streaming sink, image repository,
+-- task) live in the dedicated SC_DB.GDELT schema. Jobs run on the existing
+-- account compute pool SYSTEM_COMPUTE_POOL_CPU (do not create a dedicated pool).
 -- Progress is the gdelt_watermark channel offset token (watermark + 15m);
 -- create tables/pipes with scripts/create_gdelt_tables.py (drop+recreate reset).
 --
@@ -27,14 +28,6 @@ CREATE WAREHOUSE IF NOT EXISTS XSMALL_WH
   AUTO_RESUME = TRUE
   INITIALLY_SUSPENDED = TRUE
   COMMENT = 'Optional: local setup scripts only (not used by GDELT SPCS job)';
-
-CREATE COMPUTE POOL IF NOT EXISTS GDELT_INCREMENTAL_POOL
-  MIN_NODES = 1
-  MAX_NODES = 1
-  INSTANCE_FAMILY = CPU_X64_XS
-  AUTO_RESUME = TRUE
-  AUTO_SUSPEND_SECS = 300
-  COMMENT = 'GDELT incremental loader job (runs every 15 minutes)';
 
 CREATE IMAGE REPOSITORY IF NOT EXISTS SC_DB.GDELT.GDELT_LOADER_REPO;
 
@@ -64,7 +57,8 @@ GRANT USAGE ON SCHEMA SC_DB.GDELT TO ROLE ACCOUNTADMIN;
 GRANT CREATE TABLE, CREATE PIPE, CREATE STAGE, CREATE IMAGE REPOSITORY, CREATE SERVICE, CREATE TASK
   ON SCHEMA SC_DB.GDELT TO ROLE ACCOUNTADMIN;
 GRANT USAGE ON WAREHOUSE XSMALL_WH TO ROLE ACCOUNTADMIN;
-GRANT USAGE, MONITOR ON COMPUTE POOL GDELT_INCREMENTAL_POOL TO ROLE ACCOUNTADMIN;
+-- Reuse the account's existing pool (default: SYSTEM_COMPUTE_POOL_CPU).
+GRANT USAGE, MONITOR ON COMPUTE POOL SYSTEM_COMPUTE_POOL_CPU TO ROLE ACCOUNTADMIN;
 GRANT USAGE ON INTEGRATION gdelt_public_access TO ROLE ACCOUNTADMIN;
 GRANT READ, WRITE ON IMAGE REPOSITORY SC_DB.GDELT.GDELT_LOADER_REPO TO ROLE ACCOUNTADMIN;
 GRANT READ, WRITE ON STAGE SC_DB.GDELT.GDELT_STAGE TO ROLE ACCOUNTADMIN;
@@ -78,7 +72,7 @@ GRANT ROLE ACCOUNTADMIN TO USER SC_ADMINUSER;
 --
 --   CREATE NETWORK RULE IF NOT EXISTS SC_DB.SC_SCHEMA.GDELT_LOADER_POOL_INGRESS
 --     TYPE = COMPUTE_POOL MODE = INGRESS
---     VALUE_LIST = ('GDELT_INCREMENTAL_POOL');
+--     VALUE_LIST = ('SYSTEM_COMPUTE_POOL_CPU');
 --   ALTER NETWORK POLICY "<policy_name>"
 --     ADD ALLOWED_NETWORK_RULE_LIST = ('SC_DB.SC_SCHEMA.GDELT_LOADER_POOL_INGRESS');
 --
