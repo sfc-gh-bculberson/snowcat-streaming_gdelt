@@ -120,7 +120,7 @@ gdelt_incremental/
   ingest.py             One cycle: next window(s) → stream → set watermark
 main.py                 Entrypoint: run_once() then exit
 sql/
-  setup_snowflake.sql    Database/schema/image repo/EAI/grants (uses existing pool)
+  setup_snowflake.sql    Database/schema/compute pool/image repo/EAI/grants
   create_task.sql         CREATE TASK … AS EXECUTE JOB SERVICE … (every 15 min)
 spcs/
   job_spec.yaml           SPCS job container spec (templated)
@@ -149,10 +149,9 @@ python scripts/render_sql.py
 # Review sql/setup_snowflake.rendered.sql, then run it (Snowsight, SnowSQL, or `snow sql -f`)
 ```
 
-Creates the database/schema, an image repository, a stage, and the network
-rule / external access integration for outbound GDELT + Snowflake ingest
-traffic. SPCS jobs use the existing account pool `SYSTEM_COMPUTE_POOL_CPU`
-(no dedicated pool is created).
+Creates the database/schema, a 1-node compute pool (`GDELT_INCREMENTAL_POOL`),
+an image repository, a stage, and the network rule / external access
+integration for outbound GDELT + Snowflake ingest traffic.
 
 ### 3. Register a key pair and create tables (local dev auth)
 
@@ -277,3 +276,7 @@ offset token commits (`wait_for_commit`), the next run re-ingests that window
 `GLOBALEVENTID` / `GKGRECORDID`, so downstream de-duplication is straightforward,
 e.g. `QUALIFY ROW_NUMBER() OVER (PARTITION BY GLOBALEVENTID ORDER BY client_ts_ms DESC) = 1`
 on `EVENTS`.
+
+If GDELT returns `404` for a file, that table is skipped for the window. After
+all three files are attempted, the watermark is still set to that window's
+timestamp (the lag ceiling is meant to avoid racing unpublished windows).

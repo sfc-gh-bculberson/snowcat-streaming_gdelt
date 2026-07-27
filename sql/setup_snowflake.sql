@@ -3,11 +3,11 @@
 -- placeholders (<...>) before running, or use scripts/render_sql.py
 -- which renders this file from your .env.
 --
--- All GDELT objects (tables, pipes, watermark streaming sink, image repository,
--- task) live in the dedicated <database>.GDELT schema. Jobs run on the existing
--- account compute pool <compute_pool> (do not create a dedicated pool).
--- Progress is the gdelt_watermark channel offset token (watermark + 15m);
--- create tables/pipes with scripts/create_gdelt_tables.py (drop+recreate reset).
+-- All GDELT objects (tables, pipes, watermark streaming sink, compute pool,
+-- image repository, task) live in the dedicated <database>.GDELT schema.
+-- SPCS jobs use compute pool <compute_pool> (default GDELT_INCREMENTAL_POOL,
+-- CPU_X64_XS). Progress is the gdelt_watermark channel offset token
+-- (watermark + 15m); create tables/pipes with scripts/create_gdelt_tables.py.
 --
 -- Unlike a long-running streaming service, this job container authenticates
 -- to Snowflake with its own SPCS session token (AUTHORIZATION_TYPE=SPCS) --
@@ -28,6 +28,14 @@ CREATE WAREHOUSE IF NOT EXISTS <warehouse>
   AUTO_RESUME = TRUE
   INITIALLY_SUSPENDED = TRUE
   COMMENT = 'Optional: local setup scripts only (not used by GDELT SPCS job)';
+
+CREATE COMPUTE POOL IF NOT EXISTS <compute_pool>
+  MIN_NODES = 1
+  MAX_NODES = 1
+  INSTANCE_FAMILY = CPU_X64_XS
+  AUTO_RESUME = TRUE
+  AUTO_SUSPEND_SECS = 300
+  COMMENT = 'GDELT incremental loader job (runs every 15 minutes)';
 
 CREATE IMAGE REPOSITORY IF NOT EXISTS <database>.GDELT.<image_repo>;
 
@@ -57,7 +65,6 @@ GRANT USAGE ON SCHEMA <database>.GDELT TO ROLE <role>;
 GRANT CREATE TABLE, CREATE PIPE, CREATE STAGE, CREATE IMAGE REPOSITORY, CREATE SERVICE, CREATE TASK
   ON SCHEMA <database>.GDELT TO ROLE <role>;
 GRANT USAGE ON WAREHOUSE <warehouse> TO ROLE <role>;
--- Reuse the account's existing pool (default: SYSTEM_COMPUTE_POOL_CPU).
 GRANT USAGE, MONITOR ON COMPUTE POOL <compute_pool> TO ROLE <role>;
 GRANT USAGE ON INTEGRATION gdelt_public_access TO ROLE <role>;
 GRANT READ, WRITE ON IMAGE REPOSITORY <database>.GDELT.<image_repo> TO ROLE <role>;

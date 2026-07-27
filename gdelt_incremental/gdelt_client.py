@@ -102,11 +102,6 @@ def ingest_ceiling(
     return format_timestamp(current - WINDOW * lag_windows)
 
 
-def next_window_after(last_watermark: str) -> str:
-    """The next ingest window: last watermark + 15 minutes."""
-    return format_timestamp(parse_timestamp(last_watermark) + WINDOW)
-
-
 def pending_timestamps(
     last_watermark: Optional[str],
     ceiling: str,
